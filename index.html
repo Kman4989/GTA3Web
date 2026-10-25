@@ -86,10 +86,49 @@
 		font-size: 12px;
 		color: #888;
 	}
+	#launcher {
+		display: none;
+		position: fixed;
+		inset: 0;
+		z-index: 1100;
+		background: #000;
+		color: #ccc;
+		font-family: "Consolas", "Menlo", monospace;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 14px;
+		text-align: center;
+		padding: 24px;
+		box-sizing: border-box;
+	}
+	#launcher h1 { color: #fff; font-size: 22px; margin: 0; }
+	#launcher p { max-width: 560px; margin: 0; font-size: 13px; line-height: 1.5; color: #aaa; }
+	#launcher button, #launcher label.btn {
+		background: #2a6fdb;
+		color: #fff;
+		border: 0;
+		border-radius: 4px;
+		padding: 12px 22px;
+		font: inherit;
+		font-size: 15px;
+		cursor: pointer;
+	}
+	#launcher button.secondary { background: #333; }
+	#launcher button:hover, #launcher label.btn:hover { filter: brightness(1.2); }
+	#launcherError { color: #ff6b6b; min-height: 1.2em; max-width: 560px; font-size: 13px; }
 </style>
 </head>
 <body>
 <canvas id="canvas"></canvas>
+<div id="launcher">
+	<h1>re3 web port</h1>
+	<p>Opened straight from disk. Browsers don't let a web page read its sibling files on its own, so pick the folder that contains this <b>index.html</b> (the one with <b>re3.js</b>, <b>re3.wasm</b>, <b>audio</b>, <b>models</b> and <b>txd</b> in it). Nothing is uploaded - the files are read locally.</p>
+	<button id="launcherResume" class="secondary" style="display:none"></button>
+	<button id="launcherPick">Select game folder</button>
+	<label class="btn" id="launcherPickFallback" style="display:none">Select game folder<input id="launcherInput" type="file" webkitdirectory directory multiple style="display:none"></label>
+	<div id="launcherError"></div>
+</div>
 <div id="loadingOverlay">
 	<div class="spinner"></div>
 	<div id="loadingStatus">Starting up...</div>
@@ -179,6 +218,187 @@
 		showCrash('Unhandled promise rejection', r && r.stack ? r.stack : msg);
 	});
 </script>
-<script src="re3.js"></script>
+<script>
+// ---------------------------------------------------------------------------------------
+// Launcher. Over http(s) this just loads re3.js like normal. Over file:// (i.e. the user
+// double-clicked index.html) browsers block fetch()/XHR of local files, which is how the
+// engine loads re3.wasm, re3.data.*, the lazy audio/model/texture chunks and the manifest.
+// So the user picks the game folder once, and fetch() is shimmed to answer those requests
+// straight from the selected files. No server needed, nothing is copied or uploaded.
+// ---------------------------------------------------------------------------------------
+(function () {
+	var isFile = location.protocol === 'file:';
+	var vfs = new Map();          // lower-cased relative path -> { file } | { handle }
+	var realFetch = window.fetch.bind(window);
+
+	var MIME = { wasm: 'application/wasm', js: 'text/javascript', json: 'application/json' };
+
+	function toKey(url) {
+		if (/^(blob|data|javascript):/i.test(url)) return null;
+		var u;
+		try { u = new URL(url, location.href); } catch (e) { return null; }
+		if (u.protocol !== 'file:' && u.origin !== location.origin) return null;
+		var base = location.href.replace(/[?#].*$/, '');
+		base = base.substring(0, base.lastIndexOf('/') + 1);
+		var full = u.href.replace(/[?#].*$/, '');
+		if (full.indexOf(base) !== 0) return null;
+		var key = full.substring(base.length);
+		try { key = decodeURIComponent(key); } catch (e) {}
+		return key.replace(/\\/g, '/').replace(/^\.?\/+/, '').toLowerCase();
+	}
+
+	function getFile(entry) {
+		return entry.file ? Promise.resolve(entry.file) : entry.handle.getFile();
+	}
+
+	function installFetchShim() {
+		window.fetch = function (input, init) {
+			var url = typeof input === 'string' ? input : (input && input.url) || String(input);
+			var key = toKey(url);
+			if (key === null) return realFetch(input, init);
+			var entry = vfs.get(key);
+			if (!entry) {
+				return Promise.resolve(new Response('Not found: ' + key, { status: 404, statusText: 'Not Found' }));
+			}
+			return getFile(entry).then(function (f) {
+				var ext = key.substring(key.lastIndexOf('.') + 1);
+				var headers = { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Content-Length': String(f.size) };
+				var rng = init && init.headers && (init.headers.Range || init.headers.range);
+				var m = rng && /^bytes=(\d+)-(\d*)$/.exec(rng);
+				if (m) {
+					var from = +m[1], to = m[2] ? Math.min(+m[2], f.size - 1) : f.size - 1;
+					headers['Content-Length'] = String(to - from + 1);
+					headers['Content-Range'] = 'bytes ' + from + '-' + to + '/' + f.size;
+					return new Response(f.slice(from, to + 1), { status: 206, headers: headers });
+				}
+				return new Response(f, { status: 200, headers: headers });
+			});
+		};
+	}
+
+	function showError(msg) {
+		document.getElementById('launcherError').textContent = msg || '';
+	}
+
+	// Finds re3.js among the picked files and re-roots paths relative to its folder, so it
+	// doesn't matter whether the user picked the folder itself or its parent.
+	function mount(list) { // list: [{ path, file|handle }]
+		var root = null;
+		for (var i = 0; i < list.length; i++) {
+			var p = list[i].path;
+			if (/(^|\/)re3\.js$/i.test(p) && (root === null || p.length < root.length)) root = p;
+		}
+		if (root === null) return false;
+		var prefix = root.substring(0, root.length - 're3.js'.length);
+		vfs.clear();
+		list.forEach(function (e) {
+			if (e.path.indexOf(prefix) !== 0) return;
+			var rel = e.path.substring(prefix.length).replace(/\\/g, '/');
+			vfs.set(rel.toLowerCase(), e.file ? { file: e.file } : { handle: e.handle });
+		});
+		return vfs.has('re3.wasm') && vfs.has('re3.data.000');
+	}
+
+	function startGame() {
+		var launcher = document.getElementById('launcher');
+		if (launcher) launcher.style.display = 'none';
+		var go = function (src) {
+			// Relative paths resolve against the page (and get answered by the shim).
+			Module.locateFile = function (p) { return p; };
+			var sc = document.createElement('script');
+			sc.src = src;
+			sc.onerror = function () { showCrash('Failed to load re3.js', src); };
+			document.body.appendChild(sc);
+		};
+		if (!isFile) return go('re3.js');
+		getFile(vfs.get('re3.js')).then(function (f) {
+			go(URL.createObjectURL(new Blob([f], { type: 'text/javascript' })));
+		}, function (e) { showCrash('Could not read re3.js', String(e)); });
+	}
+
+	function finish(list) {
+		if (!mount(list)) {
+			showError('That folder doesn\'t look right: it needs re3.js, re3.wasm and re3.data.* in it. Pick the game folder (the one that contains index.html).');
+			return false;
+		}
+		installFetchShim();
+		startGame();
+		return true;
+	}
+
+	// ---- plain http(s): nothing to do ----
+	if (!isFile) { startGame(); return; }
+
+	var launcher = document.getElementById('launcher');
+	launcher.style.display = 'flex';
+
+	// ---- Chromium: File System Access API, remembers the folder between visits ----
+	function idb(mode, fn) {
+		return new Promise(function (resolve, reject) {
+			var open = indexedDB.open('gta3web-launcher', 1);
+			open.onupgradeneeded = function () { open.result.createObjectStore('h'); };
+			open.onerror = function () { reject(open.error); };
+			open.onsuccess = function () {
+				var tx = open.result.transaction('h', mode);
+				var req = fn(tx.objectStore('h'));
+				tx.oncomplete = function () { resolve(req && req.result); };
+				tx.onerror = function () { reject(tx.error); };
+			};
+		});
+	}
+
+	async function walk(dirHandle, prefix, out) {
+		for await (var entry of dirHandle.values()) {
+			if (entry.kind === 'directory') await walk(entry, prefix + entry.name + '/', out);
+			else out.push({ path: prefix + entry.name, handle: entry });
+		}
+	}
+
+	async function useDirHandle(dir) {
+		showError('Reading folder...');
+		var out = [];
+		await walk(dir, '', out);
+		showError('');
+		if (finish(out)) { try { await idb('readwrite', function (s) { return s.put(dir, 'root'); }); } catch (e) {} }
+	}
+
+	var pickBtn = document.getElementById('launcherPick');
+	var fallback = document.getElementById('launcherPickFallback');
+	var input = document.getElementById('launcherInput');
+
+	if (window.showDirectoryPicker) {
+		pickBtn.onclick = async function () {
+			try {
+				await useDirHandle(await window.showDirectoryPicker({ id: 'gta3web', mode: 'read' }));
+			} catch (e) { if (e && e.name !== 'AbortError') showError(String(e && e.message || e)); }
+		};
+		// Offer one-click resume with the folder picked last time.
+		idb('readonly', function (s) { return s.get('root'); }).then(function (dir) {
+			if (!dir) return;
+			var b = document.getElementById('launcherResume');
+			b.textContent = 'Continue with "' + dir.name + '"';
+			b.style.display = '';
+			b.onclick = async function () {
+				try {
+					if ((await dir.requestPermission({ mode: 'read' })) !== 'granted') return showError('Permission denied.');
+					await useDirHandle(dir);
+				} catch (e) { showError(String(e && e.message || e)); }
+			};
+		}).catch(function () {});
+	} else {
+		// ---- Firefox / Safari: classic folder input ----
+		pickBtn.style.display = 'none';
+		fallback.style.display = '';
+	}
+
+	input.onchange = function () {
+		var list = Array.prototype.map.call(input.files, function (f) {
+			return { path: f.webkitRelativePath || f.name, file: f };
+		});
+		finish(list);
+	};
+	window.__gta3vfs = { vfs: vfs, toKey: toKey, mount: mount, installFetchShim: installFetchShim };
+})();
+</script>
 </body>
 </html>
